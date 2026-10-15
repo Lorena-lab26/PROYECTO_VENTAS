@@ -438,3 +438,151 @@ class VentaController(CrudBase):
         for venta in self.lista:
             total += venta.calcular_total()
         return round(total, 2)
+# =====================================================================
+# CONTROLADOR DE DEVOLUCIONES
+# =====================================================================
+class DevolucionController(CrudBase):
+
+    def __init__(self, ventas, productos, archivo="data/devoluciones.json"):
+        self.ventas = ventas
+        self.productos = productos
+        self.gestor = GestorJSON(archivo)
+
+        self.lista = []
+        for datos in self.gestor.leer():
+            self.lista.append(Devolucion.desde_diccionario(datos))
+
+    def guardar(self):
+        datos = []
+        for devolucion in self.lista:
+            datos.append(devolucion.a_diccionario())
+        self.gestor.guardar(datos)
+
+    def leer(self):
+        return self.lista
+
+    def obtener(self, id_devolucion):
+        for dev in self.lista:
+            if dev.id == id_devolucion:
+                return dev
+        return None
+
+    def buscar(self, texto):
+        texto = texto.strip().lower()
+        encontradas = []
+        if texto == "":
+            return encontradas
+        for dev in self.lista:
+            if texto in dev.fecha or texto in dev.motivo.lower():
+                encontradas.append(dev)
+        return encontradas
+
+    def siguiente(self):
+        mayor = 0
+        for dev in self.lista:
+            if dev.id > mayor:
+                mayor = dev.id
+        return mayor + 1
+
+    def devoluciones_de_venta(self, venta_id):
+        return [dev for dev in self.lista if dev.venta_id == venta_id]
+
+    def cantidad_devuelta(self, venta_id):
+        return sum(dev.cantidad for dev in self.devoluciones_de_venta(venta_id))
+
+    def cantidad_disponible(self, venta):
+        return venta.cantidad - self.cantidad_devuelta(venta.id)
+
+    def calcular_reembolso(self, venta, cantidad):
+        return Producto.con_iva(cantidad * venta.precio_unitario)
+
+    def validar(self, datos):
+        try:
+            venta_id = int(datos.get("venta_id", 0))
+            cantidad = int(datos.get("cantidad", 0))
+        except (TypeError, ValueError):
+            return "venta_id y cantidad deben ser números enteros"
+
+        venta = self.ventas.obtener(venta_id)
+        if venta is None:
+            return f"No existe la venta con id {venta_id}"
+
+        if not Devolucion.dentro_del_plazo(venta.fecha):
+            return "La venta está fuera del plazo de 30 días para devoluciones"
+
+        disponible = self.cantidad_disponible(venta)
+        if cantidad <= 0:
+            return "La cantidad debe ser mayor a 0"
+        if cantidad > disponible:
+            return f"Solo se pueden devolver {disponible} unidad(es)"
+
+        motivo = str(datos.get("motivo", "")).strip().lower()
+        if not Devolucion.es_motivo_valido(motivo):
+            return f"Motivo no válido. Opciones permitidas: {', '.join(Devolucion.MOTIVOS)}"
+
+        return None
+
+    def crear(self, datos):
+        error = self.validar(datos)
+        if error:
+            return False, error
+
+        venta_id = int(datos["venta_id"])
+        cantidad = int(datos["cantidad"])
+        motivo = str(datos["motivo"]).strip().lower()
+
+        venta = self.ventas.obtener(venta_id)
+        monto = self.calcular_reembolso(venta, cantidad)
+
+        devolucion = Devolucion(
+            self.siguiente(),
+            venta_id,
+            cantidad,
+            motivo,
+            monto
+        )
+
+        # Si el motivo permite reingresar al stock
+        if devolucion.regresa_al_stock():
+            producto = self.productos.obtener(venta.producto_id)
+            if producto is not None:
+                producto.devolver_stock(cantidad)
+                self.productos.guardar()
+
+        self.lista.append(devolucion)
+        self.guardar()
+        return True, f"Devolución {devolucion.id} registrada · reembolso ${monto:.2f}"
+
+    def actualizar(self, id_registro, datos):
+        return False, "Las devoluciones no se pueden modificar"
+
+    def eliminar(self, id_registro):
+        return False, "Las devoluciones no se pueden eliminar"
+
+    def nota_credito(self, id_devolucion):
+        dev = self.obtener(id_devolucion)
+        if dev is None:
+            return None
+
+        venta = self.ventas.obtener(dev.venta_id)
+        cliente = self.ventas.clientes.obtener(venta.cliente_id) if venta else None
+        producto = self.ventas.productos.obtener(venta.producto_id) if venta else None
+
+        texto = f"NOTA DE CRÉDITO #{dev.id}   fecha: {dev.fecha}\n"
+        texto += f"Venta    : #{venta.id if venta else 'desconocida'}   ({cliente.nombre_completo() if cliente else 'eliminado'})\n"
+        texto += f"Producto : {producto.nombre if producto else 'eliminado'}\n"
+        texto += f"Devuelto : {dev.cantidad} x ${venta.precio_unitario:.2f}\n" if venta else ""
+        texto += f"Motivo   : {dev.motivo}\n"
+        texto += "-" * 42 + "\n"
+        texto += f"REEMBOLSO con IVA: ${dev.monto:.2f}\n"
+        texto += f"Stock    : {'regresa al inventario' if dev.regresa_al_stock() else 'sin cambio (defectuoso)'}"
+        return texto
+
+    def devoluciones_por_motivo(self):
+        agrupadas = {}
+        for dev in self.lista:
+            agrupadas.setdefault(dev.motivo, []).append(dev)
+        return agrupadas
+
+    def total_reembolsado(self):
+        return round(sum(dev.monto for dev in self.lista), 2)
